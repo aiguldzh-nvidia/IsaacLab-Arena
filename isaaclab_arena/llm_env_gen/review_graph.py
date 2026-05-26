@@ -12,27 +12,40 @@ Three panels (dark dashboard style):
     the graph rather than rendered as self-loops.
   * Bottom-left — task table (id, type, initial/success state ids, task_args).
   * Right — node card grid: type badge, asset name, and the per-node YAML
-    stanza. ``_render_node_thumbnail`` is the single integration point for
-    a future real USD-snapshot renderer (e.g. ``pxr.UsdAppUtils.FrameRecorder``
-    / ``usdrecord``); v1 emits a styled placeholder so the script stays
-    lightweight and runs outside the Isaac Sim Docker container.
+    stanza. With ``--render-thumbnails``, the per-node thumbnail is a real
+    USD viewport capture (cached on disk and inlined as base64); otherwise
+    a styled placeholder keeps the script lightweight.
 
 Usage:
-    # Default: writes <yaml_stem>.html alongside the input file.
+    # Default: writes <yaml_stem>.html alongside the input file. Lightweight.
     python -m isaaclab_arena.llm_env_gen.review_graph \\
         --yaml isaaclab_arena/tests/test_data/pick_and_place_maple_table_env_graph.yaml
 
-    # Explicit output path:
-    python -m isaaclab_arena.llm_env_gen.review_graph \\
+    # With real per-node USD snapshots (boots Isaac Sim once, ~30s):
+    /isaac-sim/python.sh -m isaaclab_arena.llm_env_gen.review_graph \\
         --yaml isaaclab_arena_environments/llm_generated/<env>_proposal.yaml \\
-        --out /tmp/review.html
+        --render-thumbnails --open
+
+Note on USD rendering:
+    ``pxr.UsdAppUtils.FrameRecorder`` and the ``usdrecord`` CLI are NOT
+    available inside the Isaac Sim container (Kit ships ``UsdAppUtils.py``
+    but strips out ``libusd_usdAppUtils.so``, and ``usdrecord`` is omitted
+    entirely). The Kit-equivalent path used here is:
+    ``omni.usd`` to open the stage + ``omni.kit.viewport.utility`` to
+    capture the active viewport. Kit transparently uses cached Nucleus
+    thumbnails when opening ``omniverse://`` URIs, so we don't need a
+    separate Nucleus-HTTPS probe path.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
+import hashlib
 import html as html_lib
 import re
+import sys
 import webbrowser
 import yaml
 from dataclasses import asdict
@@ -45,6 +58,12 @@ from isaaclab_arena.environments.arena_env_graph_spec import (
     _yaml_dict_factory,
 )
 
+# Disk cache for rendered thumbnails. Keyed by sha1(usd_path) so identical
+# USDs across envs reuse the same PNG. Survives across runs to avoid the
+# ~30s SimulationApp boot when nothing changed.
+_THUMBNAIL_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "llm_env_gen_thumbnails"
+_THUMBNAIL_SIZE = 256
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -56,15 +75,41 @@ def main() -> None:
         help="Output HTML path. Defaults to <yaml_stem>.html next to the input.",
     )
     parser.add_argument("--open", action="store_true", help="Open the resulting HTML in the default browser.")
+    parser.add_argument(
+        "--render-thumbnails",
+        action="store_true",
+        help=(
+            "Boot Isaac Sim once and capture per-node USD viewport thumbnails "
+            "(cached under .cache/llm_env_gen_thumbnails/). Slow first run "
+            "(~30s SimulationApp boot + ~2s per unique USD); subsequent runs "
+            "reuse cached PNGs. Must run inside the Isaac Sim container."
+        ),
+    )
     args = parser.parse_args()
 
     spec = ArenaEnvGraphSpec.from_yaml(args.yaml)
     out_path = args.out or args.yaml.with_suffix(".html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(_render_html(spec), encoding="utf-8")
-    print(f"Wrote {out_path}")
-    if args.open:
-        webbrowser.open(out_path.resolve().as_uri())
+
+    # Important: when --render-thumbnails is set, we keep SimulationApp open
+    # across the HTML write. Calling ``app.close()`` first can ``os._exit(0)``
+    # (Kit's normal shutdown behavior) and silently drop the write_text below.
+    app = None
+    try:
+        thumbnails: dict[str, bytes] = {}
+        if args.render_thumbnails:
+            app = _launch_simulation_app()
+            if app is not None:
+                thumbnails = _render_thumbnails_with_app(app, spec)
+
+        out_path.write_text(_render_html(spec, thumbnails), encoding="utf-8")
+        print(f"Wrote {out_path}")
+        if args.open:
+            webbrowser.open(out_path.resolve().as_uri())
+    finally:
+        if app is not None:
+            with contextlib.suppress(Exception):
+                app.close()
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +117,9 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_html(spec: ArenaEnvGraphSpec) -> str:
+def _render_html(spec: ArenaEnvGraphSpec, thumbnails: dict[str, bytes] | None = None) -> str:
     initial_state = _pick_initial_state(spec)
+    thumbnails = thumbnails or {}
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -101,7 +147,7 @@ def _render_html(spec: ArenaEnvGraphSpec) -> str:
   </section>
   <section class="panel nodes-panel">
     <h2>Nodes</h2>
-    <div class="node-grid">{_render_node_cards(spec)}</div>
+    <div class="node-grid">{_render_node_cards(spec, thumbnails)}</div>
   </section>
 </main>
 <script>mermaid.initialize({{ startOnLoad: true, theme: 'dark', themeVariables: {{ fontFamily: 'ui-monospace, monospace' }} }});</script>
@@ -253,14 +299,14 @@ def _render_tasks_table(spec: ArenaEnvGraphSpec) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _render_node_cards(spec: ArenaEnvGraphSpec) -> str:
-    return "\n".join(_render_one_node_card(node) for node in spec.nodes)
+def _render_node_cards(spec: ArenaEnvGraphSpec, thumbnails: dict[str, bytes]) -> str:
+    return "\n".join(_render_one_node_card(node, thumbnails.get(node.id)) for node in spec.nodes)
 
 
-def _render_one_node_card(node: ArenaEnvGraphNodeSpec) -> str:
+def _render_one_node_card(node: ArenaEnvGraphNodeSpec, png_bytes: bytes | None) -> str:
     node_dict = asdict(node, dict_factory=_yaml_dict_factory)
     node_yaml = yaml.safe_dump(node_dict, sort_keys=False).rstrip()
-    thumb = _render_node_thumbnail(node)
+    thumb = _render_node_thumbnail(node, png_bytes)
     return f"""<article class="node-card type-{html_lib.escape(node.type.value)}">
   {thumb}
   <div class="node-meta">
@@ -271,20 +317,327 @@ def _render_one_node_card(node: ArenaEnvGraphNodeSpec) -> str:
 </article>"""
 
 
-def _render_node_thumbnail(node: ArenaEnvGraphNodeSpec) -> str:
-    """Single integration point for per-node preview rendering.
+def _render_node_thumbnail(node: ArenaEnvGraphNodeSpec, png_bytes: bytes | None = None) -> str:
+    """Per-node thumbnail: real USD viewport capture if rendered, else placeholder.
 
-    Currently emits a styled placeholder. To wire in real USD snapshots, look
-    up the asset's USD path via ``AssetRegistry.get_asset_by_name(node.name)``,
-    render a PNG with ``pxr.UsdAppUtils.FrameRecorder`` (or shell out to the
-    ``usdrecord`` CLI), and return an ``<img src="data:image/png;base64,...">``
-    instead. The rest of the layout doesn't need to change.
+    When ``png_bytes`` is provided (i.e. ``--render-thumbnails`` ran and the
+    asset was successfully captured by :func:`_render_thumbnails_for_spec`),
+    inline the PNG as a ``data:image/png;base64,...`` URI so the resulting
+    HTML is fully self-contained — no sidecar files to keep next to the page.
+
+    Otherwise fall back to the lightweight two-letter placeholder card, so
+    a default ``python -m ... review_graph --yaml ...`` invocation still
+    produces a useful page without booting Isaac Sim.
     """
+    if png_bytes:
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        return (
+            '<div class="thumb thumb-rendered">'
+            f'<img src="data:image/png;base64,{b64}" alt="{html_lib.escape(node.name)} thumbnail">'
+            f'<span class="thumb-name">{html_lib.escape(node.name)}</span>'
+            "</div>"
+        )
     initial = (node.name[:2] if node.name else "?").upper()
     return f"""<div class="thumb">
     <span class="thumb-initial">{html_lib.escape(initial)}</span>
     <span class="thumb-name">{html_lib.escape(node.name)}</span>
   </div>"""
+
+
+# ---------------------------------------------------------------------------
+# USD viewport capture (opt-in via --render-thumbnails)
+# ---------------------------------------------------------------------------
+
+
+def _render_thumbnails_with_app(app, spec: ArenaEnvGraphSpec) -> dict[str, bytes]:
+    """Resolve each node's USD via ``AssetRegistry``, render or read cache.
+
+    ``app`` must already be a booted ``SimulationApp``. The caller owns the
+    lifecycle so the HTML write can happen before ``app.close()`` (which Kit
+    may turn into ``os._exit(0)``).
+
+    Returns ``{node.id: png_bytes}`` for nodes whose asset USD could be
+    located *and* rendered. Missing entries fall through to the placeholder
+    in :func:`_render_node_thumbnail`, so a partial failure (one bad asset)
+    never breaks the rest of the page.
+
+    Ordering matters: ``SimulationApp`` MUST be launched before any
+    ``AssetRegistry`` access, because ``ensure_assets_registered()`` imports
+    isaaclab asset modules which transitively load ``pxr``. ``pxr`` loaded
+    before ``AppLauncher`` puts Kit's extension manager into an unrecoverable
+    state ("extension class wrapper for base class ... has not been created
+    yet"). This is the same root cause we fixed for the pytest suite.
+    """
+    asset_paths = _resolve_node_usd_paths(spec)
+    if not asset_paths:
+        print("[review_graph] no asset USD paths resolved; skipping thumbnail rendering.", file=sys.stderr)
+        return {}
+
+    _THUMBNAIL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Split into cache-hits vs to-render. Cache key is sha1(usd_path) so
+    # the same USD across multiple envs / nodes hits the same PNG.
+    rendered: dict[str, bytes] = {}
+    to_render: dict[str, tuple[str, Path]] = {}
+    for node_id, usd_path in asset_paths.items():
+        cache_path = _THUMBNAIL_CACHE_DIR / f"{_usd_cache_key(usd_path)}.png"
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            rendered[node_id] = cache_path.read_bytes()
+        else:
+            to_render[node_id] = (usd_path, cache_path)
+
+    if to_render:
+        print(
+            f"[review_graph] rendering {len(to_render)} new thumbnail(s) "
+            f"(reusing {len(rendered)} from cache at {_THUMBNAIL_CACHE_DIR})...",
+            file=sys.stderr,
+        )
+        rendered.update(_capture_usd_thumbnails(app, to_render))
+    else:
+        print(f"[review_graph] all {len(rendered)} thumbnail(s) served from cache.", file=sys.stderr)
+
+    return rendered
+
+
+def _launch_simulation_app():
+    """Boot Isaac Sim's ``SimulationApp`` for headless viewport capture, or ``None`` on failure.
+
+    Kept as a tiny helper so the call site can lazy-import inside this
+    function — module-level import of ``simulation_app`` would drag Kit
+    into every invocation, including ``--help``.
+    """
+    try:
+        # Lazy-import: keeps the default ``review_graph`` invocation Kit-free.
+        from isaaclab_arena.utils.isaaclab_utils.simulation_app import get_app_launcher  # noqa: PLC0415
+
+        sim_args = argparse.Namespace(headless=True, enable_cameras=True, hide_ui=True, livestream=-1)
+        return get_app_launcher(sim_args).app
+    except Exception as exc:
+        print(f"[review_graph] SimulationApp launch failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _resolve_node_usd_paths(spec: ArenaEnvGraphSpec) -> dict[str, str]:
+    """Map ``node.id → usd_path`` via :class:`AssetRegistry`, skipping unresolvable nodes.
+
+    ``usd_path`` is read as a class attribute (the convention used by every
+    ``LibraryObject`` subclass in ``object_library.py``); we never instantiate
+    the asset class. This function MUST be called only after ``SimulationApp``
+    has booted — see the docstring of :func:`_render_thumbnails_for_spec` for
+    why.
+    """
+    try:
+        from isaaclab_arena.assets.registries import AssetRegistry  # noqa: PLC0415
+    except Exception as exc:
+        print(f"[review_graph] AssetRegistry import failed: {exc}", file=sys.stderr)
+        return {}
+
+    registry = AssetRegistry()
+    paths: dict[str, str] = {}
+    for node in spec.nodes:
+        try:
+            if not registry.is_registered(node.name):
+                print(f"[review_graph]   {node.id}: asset '{node.name}' not registered, skipping.", file=sys.stderr)
+                continue
+            cls = registry.get_asset_by_name(node.name)
+            usd_path = getattr(cls, "usd_path", None)
+            if not usd_path:
+                print(f"[review_graph]   {node.id}: '{node.name}' has no usd_path, skipping.", file=sys.stderr)
+                continue
+            paths[node.id] = usd_path
+        except Exception as exc:
+            print(f"[review_graph]   {node.id}: lookup failed for '{node.name}': {exc}", file=sys.stderr)
+    return paths
+
+
+def _usd_cache_key(usd_path: str) -> str:
+    return hashlib.sha1(usd_path.encode("utf-8")).hexdigest()[:16]
+
+
+def _capture_usd_thumbnails(app, to_render: dict[str, tuple[str, Path]]) -> dict[str, bytes]:
+    """Capture all queued USDs under one already-booted ``SimulationApp``.
+
+    Deduplicates by ``usd_path`` so the same USD shared by multiple nodes is
+    only rendered once and the bytes are fanned back out.
+    """
+    out: dict[str, bytes] = {}
+
+    path_to_node_ids: dict[str, list[str]] = {}
+    path_to_cache: dict[str, Path] = {}
+    for node_id, (usd_path, cache_path) in to_render.items():
+        path_to_node_ids.setdefault(usd_path, []).append(node_id)
+        path_to_cache[usd_path] = cache_path
+
+    for usd_path, node_ids in path_to_node_ids.items():
+        cache_path = path_to_cache[usd_path]
+        try:
+            png_bytes = _render_one_usd(app, usd_path, cache_path)
+        except Exception as exc:
+            print(f"[review_graph]   render failed for {usd_path}: {exc}", file=sys.stderr)
+            continue
+        if png_bytes:
+            for node_id in node_ids:
+                out[node_id] = png_bytes
+
+    return out
+
+
+def _render_one_usd(app, usd_path: str, cache_path: Path) -> bytes | None:
+    """Open ``usd_path`` directly as the stage, frame the camera, capture PNG.
+
+    Opening the USD as the stage root (rather than ``new_stage`` + reference
+    wrapper) is what makes viewport capture actually produce a file in
+    headless mode — Kit's viewport machinery binds to the just-opened stage
+    cleanly, whereas a referenced sub-stage left the render product empty in
+    every test we tried. The trade-off is that we lose isolation between
+    captures (each call replaces the stage), but Kit handles that fine
+    because we call ``open_stage`` again on the next asset.
+    """
+    import omni.usd  # noqa: PLC0415
+    from omni.kit.viewport.utility import (  # noqa: PLC0415
+        capture_viewport_to_file,
+        frame_viewport_prims,
+        get_active_viewport,
+    )
+    from pxr import Sdf  # noqa: PLC0415
+
+    ctx = omni.usd.get_context()
+    if not ctx.open_stage(usd_path):
+        print(f"[review_graph]   open_stage failed: {usd_path}", file=sys.stderr)
+        return None
+    stage = ctx.get_stage()
+
+    # Wait for textures / payloads / Nucleus fetches to settle before framing.
+    _wait_for_stage_load(app, ctx)
+
+    # Standalone object USDs (avocado, bowl, ...) ship no lights, so a viewport
+    # capture renders them as a near-black silhouette against the dark skybox
+    # — that's the "blank thumbnail" symptom. Complete scene USDs (maple table)
+    # already include their own lighting, so this is a no-op for them.
+    _ensure_default_lighting(stage)
+
+    # Use the default prim if present, otherwise the pseudo-root, for framing.
+    target_prim = stage.GetDefaultPrim()
+    if not target_prim or not target_prim.IsValid():
+        target_prim = stage.GetPrimAtPath(Sdf.Path("/"))
+
+    viewport = get_active_viewport()
+
+    # Use Kit's own ``frame_viewport_prims`` (the "F"-key equivalent / ``FramePrimsCommand``)
+    # so we go through the viewport camera controller. Manually editing the
+    # ``/OmniverseKit_Persp`` xform op directly worked sometimes but Kit's
+    # camera controller treats /OmniverseKit_Persp as an internal state and
+    # silently overrode our edits for small assets — that's why avocado / bowl
+    # captured as tiny specks even with the right math. Letting Kit do the
+    # framing is both correct and avoids us re-implementing the math.
+    framed = frame_viewport_prims(viewport, prims=[str(target_prim.GetPath())])
+    if not framed:
+        print(f"[review_graph]   warning: frame_viewport_prims failed for {usd_path}", file=sys.stderr)
+
+    # Settle Hydra after camera change so the captured frame matches the new pose.
+    for _ in range(30):
+        app.update()
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    capture_obj = capture_viewport_to_file(viewport, str(cache_path))
+
+    _wait_for_capture(app, capture_obj, cache_path, max_updates=600)
+
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return cache_path.read_bytes()
+    print(f"[review_graph]   capture produced no file: {cache_path}", file=sys.stderr)
+    return None
+
+
+def _wait_for_stage_load(app, usd_context, max_updates: int = 600) -> None:
+    """Pump frames until ``usd_context.get_stage_loading_status()`` reports nothing pending.
+
+    Returns after stage load completes or after the budget is exhausted. We
+    also need a few extra frames after the count goes to zero so material
+    binding / texture upload finishes — they don't show up in the load count.
+    """
+    settled = 0
+    for _ in range(max_updates):
+        app.update()
+        try:
+            _msg, loading_count, loaded_count = usd_context.get_stage_loading_status()
+        except Exception:
+            return
+        if loading_count == 0 and loaded_count == 0:
+            settled += 1
+            if settled > 15:
+                return
+        else:
+            settled = 0
+
+
+def _wait_for_capture(app, capture_obj, cache_path: Path, max_updates: int = 600) -> None:
+    """Pump ``app.update()`` until the capture PNG lands on disk (or we time out).
+
+    Kit's capture future is fulfilled inside its async loop during
+    ``app.update()``, but future completion doesn't always coincide with the
+    file being flushed — checking the file directly is the most reliable
+    completion signal. We also keep the future-based fast path so a
+    successful capture doesn't have to wait for the file system to settle.
+    """
+    if capture_obj is None:
+        for _ in range(max_updates):
+            app.update()
+        return
+
+    future = (
+        getattr(capture_obj, "_Capture__future", None)
+        or getattr(capture_obj, "_RenderCapture__future", None)
+        or getattr(capture_obj, "future", None)
+    )
+
+    for _ in range(max_updates):
+        app.update()
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            return
+        if future is not None and future.done():
+            # Future is done but file might still be flushing — give it a few frames.
+            for _ in range(15):
+                app.update()
+                if cache_path.exists() and cache_path.stat().st_size > 0:
+                    return
+            return
+
+
+def _ensure_default_lighting(stage) -> None:
+    """Add a dome + key distant light if the stage has none.
+
+    Without this, standalone object USDs (which don't ship their own lights)
+    render as a near-black silhouette. We skip the addition if any
+    ``UsdLuxLight``-derived prim already exists on the stage to avoid
+    double-lighting scenes like the maple table that bake in their own rig.
+    """
+    from pxr import Gf, Sdf, UsdGeom, UsdLux  # noqa: PLC0415
+
+    for prim in stage.Traverse():
+        if (
+            prim.HasAPI(UsdLux.LightAPI)
+            or prim.IsA(UsdLux.BoundableLightBase)
+            or prim.IsA(UsdLux.NonboundableLightBase)
+        ):
+            return
+
+    # Soft hemispherical fill so the asset is visible from any angle, plus a
+    # weak directional key for shape definition. Intensities are tuned for
+    # OmniPBR / RTX defaults; tweak if asset libraries adopt darker materials.
+    dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/_ReviewDomeLight"))
+    dome.CreateIntensityAttr(800.0)
+    dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+
+    key = UsdLux.DistantLight.Define(stage, Sdf.Path("/_ReviewKeyLight"))
+    key.CreateIntensityAttr(2500.0)
+    key.CreateAngleAttr(2.0)
+    # Aim the key roughly from the camera's 3/4 angle so the lit side faces
+    # the viewport.
+    key_xformable = UsdGeom.Xformable(key.GetPrim())
+    key_xformable.ClearXformOpOrder()
+    rot = key_xformable.AddRotateXYZOp()
+    rot.Set(Gf.Vec3f(-45.0, 30.0, 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +700,13 @@ table.tasks pre { padding: 6px 8px; font-size: 11px; }
              padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 .node-card .thumb { aspect-ratio: 1 / 1; background: linear-gradient(135deg, #2a2f37, #1c2026);
                     border-radius: 6px; display: flex; flex-direction: column;
-                    align-items: center; justify-content: center; color: var(--fg-muted); position: relative; }
+                    align-items: center; justify-content: center; color: var(--fg-muted);
+                    position: relative; overflow: hidden; }
+.node-card .thumb-rendered { background: #0e1115; }
+.node-card .thumb-rendered img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.node-card .thumb-rendered .thumb-name { position: absolute; bottom: 0; left: 0; right: 0;
+                                         padding: 4px 6px; background: rgba(15, 17, 21, 0.78);
+                                         color: var(--fg); margin: 0; }
 .thumb-initial { font-size: 36px; font-weight: 700; color: var(--fg); opacity: 0.6;
                  font-family: ui-monospace, monospace; }
 .thumb-name { font-size: 10px; margin-top: 6px; padding: 0 8px; text-align: center; word-break: break-word; }
