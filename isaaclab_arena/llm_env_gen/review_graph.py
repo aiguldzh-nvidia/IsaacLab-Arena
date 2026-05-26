@@ -420,11 +420,20 @@ def _launch_simulation_app():
 def _resolve_node_usd_paths(spec: ArenaEnvGraphSpec) -> dict[str, str]:
     """Map ``node.id → usd_path`` via :class:`AssetRegistry`, skipping unresolvable nodes.
 
-    ``usd_path`` is read as a class attribute (the convention used by every
-    ``LibraryObject`` subclass in ``object_library.py``); we never instantiate
-    the asset class. This function MUST be called only after ``SimulationApp``
-    has booted — see the docstring of :func:`_render_thumbnails_for_spec` for
-    why.
+    Tries two lookup strategies in order:
+
+    1. Class-attribute ``cls.usd_path`` — the convention every ``LibraryObject``
+       subclass in ``object_library.py`` follows. No instantiation, cheap.
+
+    2. ``cls().scene_config.robot.spawn.usd_path`` — the convention every
+       :class:`EmbodimentBase` subclass uses. Requires instantiating the
+       embodiment because the Franka embodiments populate ``scene_config.robot``
+       inside ``__init__`` rather than as a class default. Embodiment
+       ``__init__`` is light (no Kit / sim required) — it only constructs
+       configclass objects.
+
+    This function MUST be called only after ``SimulationApp`` has booted — see
+    the docstring of :func:`_render_thumbnails_with_app` for why.
     """
     try:
         from isaaclab_arena.assets.registries import AssetRegistry  # noqa: PLC0415
@@ -440,7 +449,7 @@ def _resolve_node_usd_paths(spec: ArenaEnvGraphSpec) -> dict[str, str]:
                 print(f"[review_graph]   {node.id}: asset '{node.name}' not registered, skipping.", file=sys.stderr)
                 continue
             cls = registry.get_asset_by_name(node.name)
-            usd_path = getattr(cls, "usd_path", None)
+            usd_path = _extract_usd_path(cls)
             if not usd_path:
                 print(f"[review_graph]   {node.id}: '{node.name}' has no usd_path, skipping.", file=sys.stderr)
                 continue
@@ -448,6 +457,32 @@ def _resolve_node_usd_paths(spec: ArenaEnvGraphSpec) -> dict[str, str]:
         except Exception as exc:
             print(f"[review_graph]   {node.id}: lookup failed for '{node.name}': {exc}", file=sys.stderr)
     return paths
+
+
+def _extract_usd_path(cls) -> str | None:
+    """Return the asset's root USD path, or ``None`` if not extractable.
+
+    See :func:`_resolve_node_usd_paths` for the two strategies tried in order.
+    """
+    # Strategy 1: ``LibraryObject`` convention.
+    usd_path = getattr(cls, "usd_path", None)
+    if usd_path:
+        return usd_path
+
+    # Strategy 2: ``EmbodimentBase`` convention. Walk
+    # ``instance.scene_config.robot.spawn.usd_path``. We instantiate with no
+    # args; every embodiment ``__init__`` defaults all parameters.
+    # NoEmbodiment legitimately has no robot — its instance.scene_config
+    # exists but ``.robot`` is absent / None, so the getattr chain returns
+    # None and we silently fall through.
+    try:
+        instance = cls()
+    except Exception:
+        return None
+    scene_config = getattr(instance, "scene_config", None)
+    robot = getattr(scene_config, "robot", None) if scene_config is not None else None
+    spawn = getattr(robot, "spawn", None) if robot is not None else None
+    return getattr(spawn, "usd_path", None) if spawn is not None else None
 
 
 def _usd_cache_key(usd_path: str) -> str:
