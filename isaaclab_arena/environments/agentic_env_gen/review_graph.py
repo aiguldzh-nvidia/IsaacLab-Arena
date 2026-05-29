@@ -3,28 +3,43 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render an ArenaEnvGraphSpec YAML to a self-contained HTML review page.
+"""Live ArenaEnvGraphSpec review tool — Streamlit editor + USD thumbnails.
 
-Three panels (dark dashboard style):
+The CLI is a thin launcher: it always boots the Streamlit app in
+``review_app.py``. The static-HTML mode and the old ``--serve`` /
+``--render-thumbnails`` switches were collapsed away — thumbnails are now
+always rendered (cache-hit when possible, ``SimulationApp`` cache-miss
+otherwise), and the result is shown inside the live editor.
+
+Three panels (dark dashboard style) inside the embedded view:
   * Top-left — graph diagram (mermaid.js, CDN-loaded) of the initial-state
     spatial constraints. Anchor nodes are highlighted; constraints without
     a child (is_anchor / position_limits / at_pose / ...) are listed below
     the graph rather than rendered as self-loops.
   * Bottom-left — task table (id, type, initial/success state ids, task_args).
   * Right — node card grid: type badge, asset name, and the per-node YAML
-    stanza. With ``--render-thumbnails``, the per-node thumbnail is a real
-    USD viewport capture (cached on disk and inlined as base64); otherwise
-    a styled placeholder keeps the script lightweight.
+    stanza. The per-node thumbnail is a real USD viewport capture (cached
+    on disk under ``.cache/llm_env_gen_thumbnails/`` and inlined as base64
+    so the HTML stays self-contained).
 
 Usage:
-    # Default: writes <yaml_stem>.html alongside the input file. Lightweight.
-    python -m isaaclab_arena.llm_env_gen.review_graph \\
+    /isaac-sim/python.sh -m isaaclab_arena.environments.agentic_env_gen.review_graph \\
         --yaml isaaclab_arena/tests/test_data/pick_and_place_maple_table_env_graph.yaml
 
-    # With real per-node USD snapshots (boots Isaac Sim once, ~30s):
-    /isaac-sim/python.sh -m isaaclab_arena.llm_env_gen.review_graph \\
-        --yaml isaaclab_arena_environments/llm_generated/<env>_proposal.yaml \\
-        --render-thumbnails --open
+    # Custom port:
+    /isaac-sim/python.sh -m isaaclab_arena.environments.agentic_env_gen.review_graph \\
+        --yaml <path> --port 8600
+
+Public API used by ``review_app.py``:
+    * :func:`launch_simulation_app` — boots Kit's ``SimulationApp`` (headless +
+      cameras). Returns ``None`` on failure so the app can degrade to
+      placeholder thumbnails rather than crashing.
+    * :func:`render_thumbnails_for_spec` — given a live ``SimulationApp`` and
+      a parsed spec, returns ``{node_id: png_bytes}``. Cache-aware: existing
+      PNGs under the disk cache are read directly; missing ones are rendered
+      through the live app and written back to the cache for next time.
+    * :func:`render_html_for_spec` — full HTML payload with the given
+      thumbnails dict inlined. Pass an empty dict to fall back to placeholders.
 
 Note on USD rendering:
     ``pxr.UsdAppUtils.FrameRecorder`` and the ``usdrecord`` CLI are NOT
@@ -41,12 +56,12 @@ from __future__ import annotations
 
 import argparse
 import base64
-import contextlib
 import hashlib
 import html as html_lib
+import os
 import re
+import subprocess
 import sys
-import webbrowser
 import yaml
 from dataclasses import asdict
 from pathlib import Path
@@ -66,50 +81,129 @@ _THUMBNAIL_SIZE = 256
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--yaml", type=Path, required=True, help="Path to an ArenaEnvGraphSpec YAML file.")
-    parser.add_argument(
-        "--out",
-        type=Path,
-        default=None,
-        help="Output HTML path. Defaults to <yaml_stem>.html next to the input.",
+    """CLI entry point — argparse parses the user's flags, then we hand off
+    to Streamlit. The actual interactive UI lives in ``review_app.py``.
+    """
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--open", action="store_true", help="Open the resulting HTML in the default browser.")
     parser.add_argument(
-        "--render-thumbnails",
-        action="store_true",
-        help=(
-            "Boot Isaac Sim once and capture per-node USD viewport thumbnails "
-            "(cached under .cache/llm_env_gen_thumbnails/). Slow first run "
-            "(~30s SimulationApp boot + ~2s per unique USD); subsequent runs "
-            "reuse cached PNGs. Must run inside the Isaac Sim container."
-        ),
+        "--yaml",
+        type=Path,
+        required=True,
+        help="Path to an ArenaEnvGraphSpec YAML file. The Streamlit app will open it for live editing.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8501,
+        help="Streamlit server port (default: 8501).",
     )
     args = parser.parse_args()
+    _serve_live_editor(args.yaml, port=args.port)
 
-    spec = ArenaEnvGraphSpec.from_yaml(args.yaml)
-    out_path = args.out or args.yaml.with_suffix(".html")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Important: when --render-thumbnails is set, we keep SimulationApp open
-    # across the HTML write. Calling ``app.close()`` first can ``os._exit(0)``
-    # (Kit's normal shutdown behavior) and silently drop the write_text below.
-    app = None
+def _serve_live_editor(yaml_path: Path, port: int = 8501) -> None:
+    """Spawn ``streamlit run review_app.py -- --yaml <path>`` and wait.
+
+    This is the only path through the CLI now — the old static-HTML and
+    standalone ``--render-thumbnails`` flows were folded into the Streamlit
+    app, which boots ``SimulationApp`` once via ``@st.cache_resource`` and
+    keeps it alive for the lifetime of the server. We resolve
+    ``review_app.py`` next to this file rather than going through ``-m`` so
+    Streamlit picks the path up cleanly (``streamlit run`` doesn't accept
+    module dotted-paths).
+    """
+    app_path = Path(__file__).with_name("review_app.py")
+    if not app_path.exists():
+        raise FileNotFoundError(f"Streamlit app not found at {app_path} — installation is incomplete.")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.port",
+        str(port),
+        # Skip the email prompt the first time Streamlit runs in a fresh
+        # container — the live editor is a developer tool, not a hosted
+        # service, and an interactive prompt would block automation.
+        "--browser.gatherUsageStats",
+        "false",
+        # File watcher is a footgun here: Kit's ``SimulationApp`` boot is
+        # tens of seconds; we don't want Streamlit silently rerunning the
+        # script (and reissuing the cached_resource init) every time we
+        # save a source file during development. The user can still hit "R"
+        # in the browser to force a rerun if they want.
+        "--server.fileWatcherType",
+        "none",
+        "--",
+        "--yaml",
+        str(yaml_path.resolve()),
+    ]
+
+    # Inherit env so the Streamlit subprocess sees PYTHONPATH / isaac-sim
+    # site-packages exactly the same way we do.
+    print(f"[review_graph] launching Streamlit live editor: {' '.join(cmd)}", file=sys.stderr)
     try:
-        thumbnails: dict[str, bytes] = {}
-        if args.render_thumbnails:
-            app = _launch_simulation_app()
-            if app is not None:
-                thumbnails = _render_thumbnails_with_app(app, spec)
+        subprocess.run(cmd, env=os.environ.copy(), check=True)
+    except FileNotFoundError as exc:
+        # The plain ``pip install streamlit`` fails inside the isaaclab_arena
+        # container because streamlit≥1.30 needs uvicorn>=0.30 but Kit ships
+        # a bundled uvicorn==0.29 under a read-only /isaac-sim/extscache path.
+        # ``--user --ignore-installed`` sidesteps the rollback by writing
+        # everything to ~/.local (which is earlier on sys.path than extscache).
+        raise SystemExit(
+            "Streamlit is not installed. Inside the isaaclab_arena container run:\n"
+            "  python -m pip install --user --ignore-installed streamlit streamlit-ace"
+        ) from exc
+    except KeyboardInterrupt:
+        # Normal exit path — user hit Ctrl-C in the terminal.
+        pass
 
-        out_path.write_text(_render_html(spec, thumbnails), encoding="utf-8")
-        print(f"Wrote {out_path}")
-        if args.open:
-            webbrowser.open(out_path.resolve().as_uri())
-    finally:
-        if app is not None:
-            with contextlib.suppress(Exception):
-                app.close()
+
+# ---------------------------------------------------------------------------
+# Public API consumed by review_app.py
+# ---------------------------------------------------------------------------
+
+
+def render_html_for_spec(spec: ArenaEnvGraphSpec, thumbnails: dict[str, bytes] | None = None) -> str:
+    """Render the review HTML for ``spec``, inlining the given thumbnails.
+
+    Thin public alias of :func:`_render_html` so external entry points don't
+    have to reach into a private name. Pass ``thumbnails=None`` (or omit) to
+    fall back to placeholder thumbnails — useful when ``SimulationApp`` is
+    unavailable.
+    """
+    return _render_html(spec, thumbnails=thumbnails)
+
+
+def launch_simulation_app():
+    """Public alias for :func:`_launch_simulation_app`.
+
+    Boots Kit's ``SimulationApp`` (headless, with cameras + UI hidden) and
+    returns the live app handle. Returns ``None`` on failure so callers can
+    degrade gracefully (e.g. the Streamlit app falls back to placeholder
+    thumbnails instead of crashing).
+
+    The returned app *must* be reused across thumbnail renders — Kit only
+    supports one ``SimulationApp`` per process. The Streamlit app holds the
+    instance under ``@st.cache_resource``.
+    """
+    return _launch_simulation_app()
+
+
+def render_thumbnails_for_spec(app, spec: ArenaEnvGraphSpec) -> dict[str, bytes]:
+    """Public alias for :func:`_render_thumbnails_with_app`.
+
+    Resolves each node's USD via ``AssetRegistry``, reads the on-disk PNG
+    cache for hits, and renders cache-misses through the live ``app``
+    handle. Safe to call repeatedly across reruns — cache-hit cost is just
+    a ``read_bytes()`` per node.
+    """
+    return _render_thumbnails_with_app(app, spec)
 
 
 # ---------------------------------------------------------------------------

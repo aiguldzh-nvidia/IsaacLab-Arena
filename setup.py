@@ -22,6 +22,14 @@ DEV_DEPS = [
     "tenacity",
 ]
 
+# Live YAML editor for ArenaEnvGraphSpec (see isaaclab_arena/environments/
+# agentic_env_gen/review_app.py). Kept as an extras_require so the core
+# package install in CI / minimal containers stays Streamlit-free.
+ENV_REVIEW_DEPS = [
+    "streamlit>=1.30",
+    "streamlit-ace>=0.1.1",
+]
+
 setup(
     name="isaaclab_arena",
     version=ISAACLAB_ARENA_VERSION_NUMBER,
@@ -40,6 +48,7 @@ setup(
     install_requires=RUNTIME_DEPS,
     extras_require={
         "dev": DEV_DEPS,
+        "env-review": ENV_REVIEW_DEPS,
     },
     zip_safe=False,
 )
