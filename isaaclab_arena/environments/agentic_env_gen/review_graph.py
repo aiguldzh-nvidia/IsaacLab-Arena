@@ -478,10 +478,21 @@ def _pick_initial_state(spec: ArenaEnvGraphSpec) -> ArenaEnvGraphStateSpec | Non
 
 
 def _render_mermaid(spec: ArenaEnvGraphSpec, state: ArenaEnvGraphStateSpec | None) -> str:
-    """Emit a left-to-right mermaid graph of the spatial constraints with children.
+    """Emit a left-to-right mermaid graph of spatial and task constraints.
 
-    Constraints without a child (is_anchor / position_limits / at_pose / ...)
-    are dropped here and surfaced separately by :func:`_render_unary_constraints`.
+    Binary spatial constraints (child is set) are drawn as solid edges:
+        child -->|kind| parent
+
+    Unary spatial constraints (no child) are omitted from the graph and listed
+    below it by :func:`_render_unary_constraints` so their params are visible.
+
+    Task constraints with a child are drawn as dashed edges:
+        parent -.->|type| child
+
+    Task constraints without a child are omitted from the graph.
+
+    objectReference nodes are drawn with a dotted edge to their parent node:
+        ref_node -. ref .-> parent_node
     """
     lines = ["graph LR"]
     if state is None:
@@ -491,11 +502,12 @@ def _render_mermaid(spec: ArenaEnvGraphSpec, state: ArenaEnvGraphStateSpec | Non
     anchor_ids: set[str] = set()
     edge_nodes: set[str] = set()
 
+    # --- Spatial constraints (binary only) ---
     for c in state.spatial_constraints:
         kind = c.type.value
         if kind == "is_anchor":
             anchor_ids.add(c.parent)
-        elif c.child is not None:
+        if c.child is not None:
             lines.append(
                 f"  {_mermaid_id(c.child)}[{_mermaid_label(c.child)}]"
                 f" -->|{kind}| "
@@ -504,10 +516,30 @@ def _render_mermaid(spec: ArenaEnvGraphSpec, state: ArenaEnvGraphStateSpec | Non
             edge_nodes.add(c.child)
             edge_nodes.add(c.parent)
 
+    # --- Task constraints (dashed edges, binary only) ---
+    for tc in state.task_constraints:
+        if tc.child is not None:
+            lines.append(
+                f"  {_mermaid_id(tc.parent)}[{_mermaid_label(tc.parent)}]"
+                f" -.->|{_mermaid_label(tc.type.value)}| "
+                f"{_mermaid_id(tc.child)}[{_mermaid_label(tc.child)}]"
+            )
+            edge_nodes.add(tc.parent)
+            edge_nodes.add(tc.child)
+
     # Include every node from the spec so disconnected ones still appear.
     for node in spec.nodes:
         if node.id not in edge_nodes:
             lines.append(f"  {_mermaid_id(node.id)}[{_mermaid_label(node.id)}]")
+
+    # --- objectReference → parent edges (dotted, structural) ---
+    # Use bare node IDs (no label re-declaration) — all nodes are already
+    # declared above either in constraint edges or in the disconnected-node block.
+    nodes_by_id = spec.nodes_by_id
+    for node in spec.nodes:
+        if node.type.value == "objectReference" and node.parent is not None:
+            if node.parent in nodes_by_id:
+                lines.append(f"  {_mermaid_id(node.id)} -.->|ref| {_mermaid_id(node.parent)}")
 
     # Anchor highlight.
     for anchor_id in anchor_ids:
@@ -518,7 +550,7 @@ def _render_mermaid(spec: ArenaEnvGraphSpec, state: ArenaEnvGraphStateSpec | Non
         "background": ("#3a4f7a", "#7aa0d8"),
         "embodiment": ("#7a3a3a", "#d87a7a"),
         "object": ("#7a6b3a", "#d8c47a"),
-        "object_reference": ("#6b3a7a", "#c47ad8"),
+        "objectReference": ("#6b3a7a", "#c47ad8"),
         "lighting": ("#3a7a7a", "#7ad8d8"),
     }
     for node in spec.nodes:
