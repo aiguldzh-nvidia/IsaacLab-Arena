@@ -7,20 +7,20 @@
 
 Wraps :func:`isaaclab_arena.environments.agentic_env_gen.review_graph.render_html_for_spec`
 in a two-pane Streamlit page so the user can edit the YAML in the browser and
-re-render the dark-dashboard visualization on demand. ``SimulationApp`` is
-booted once via ``@st.cache_resource`` and reused for every thumbnail render
-(disk-cache hit when possible, live USD viewport capture when not).
+see the visualization update automatically. ``SimulationApp`` is booted once
+via ``@st.cache_resource`` and reused for every thumbnail render (disk-cache
+hit when possible, live USD viewport capture when not).
 
 Launch (always via the wrapper in review_graph.py — handles streamlit flags):
     /isaac-sim/python.sh -m isaaclab_arena.environments.agentic_env_gen.review_graph \\
         --yaml path/to/spec.yaml
 
 Design:
-  * Left pane — ``streamlit-ace`` YAML editor + validation badge + action
-    buttons. Validation runs on every rerun (i.e. after each editor blur).
-  * Right pane — sandboxed iframe with the rendered review HTML. Updates only
-    when the user clicks "Regenerate", so editing never causes mid-typing
-    re-renders.
+  * Left pane — ``streamlit-ace`` YAML editor + validation badge + Save button.
+    Validation runs on every rerun (i.e. after each editor blur). When the YAML
+    is valid and has changed since the last render, the visualization updates
+    automatically — no button click required.
+  * Right pane — sandboxed iframe with the rendered review HTML.
   * Thumbnails — real USD viewport captures. Booted ``SimulationApp`` lives
     inside an ``@st.cache_resource`` so its ~30s startup is paid once per
     server lifetime. PNGs are cached on disk under
@@ -253,7 +253,7 @@ def _initialize_state(yaml_path: Path) -> None:
 _BROKEN_PLACEHOLDER_HTML = """<!DOCTYPE html><html><body style="
     font-family: ui-monospace, monospace;
     background:#15181d; color:#e4e6eb; padding:24px; margin:0;">
-<p>No visualization yet — fix YAML and click <em>Regenerate</em>.</p>
+<p>No visualization yet — fix the YAML errors to auto-render.</p>
 </body></html>"""
 
 
@@ -275,58 +275,24 @@ def _render_validation_badge(validation: _ValidationResult) -> None:
         st.error(f"Invalid YAML\n\n```\n{validation.error}\n```", icon="🛑")
 
 
-def _render_action_buttons(validation: _ValidationResult) -> None:
-    """Render the Regenerate + Save buttons with the gating rules from the spec.
-
-    Gating (per the PR brief):
-      * Regenerate — only when edited since last render AND valid.
-      * Save — only when YAML is valid.
-    """
-    edited_since_render = st.session_state["edited_text"] != st.session_state["last_rendered_text"]
-    can_regenerate = edited_since_render and validation.is_valid
+def _render_save_button(validation: _ValidationResult) -> None:
+    """Render the Save button. Disabled while the YAML is invalid."""
     can_save = validation.is_valid
+    save_path_str = st.session_state["save_path"]
 
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        if st.button(
-            "Regenerate visualization",
-            type="primary",
-            disabled=not can_regenerate,
-            use_container_width=True,
-            help=(
-                "Re-renders the right pane from the current editor text. "
-                "Enabled only when the YAML has been edited since the last "
-                "render and currently validates."
-            ),
-        ):
-            assert validation.spec is not None  # guarded by can_regenerate
-            # ``_render_with_thumbnails`` reuses the cached ``SimulationApp``
-            # and the on-disk PNG cache — so a regen that doesn't introduce
-            # new asset names is near-instant; one that does pays roughly
-            # ~2s per new USD.
-            with st.spinner("Rendering thumbnails…"):
-                st.session_state["rendered_html"] = _render_with_thumbnails(validation.spec)
-            st.session_state["last_rendered_text"] = st.session_state["edited_text"]
-            st.toast("Visualization regenerated.", icon="🔄")
-            st.rerun()
-
-    with col_b:
-        save_path_str = st.session_state["save_path"]
-        if st.button(
-            f"Save to {Path(save_path_str).name}",
-            disabled=not can_save,
-            use_container_width=True,
-            help=f"Writes the editor contents to {save_path_str}. Disabled while YAML is invalid.",
-        ):
-            try:
-                Path(save_path_str).write_text(st.session_state["edited_text"], encoding="utf-8")
-                # Update "original" so future "edited since…" comparisons are
-                # against the just-saved file, not the very first load.
-                st.session_state["original_text"] = st.session_state["edited_text"]
-                st.toast(f"Saved → {save_path_str}", icon="💾")
-            except OSError as exc:
-                st.error(f"Save failed: {exc}", icon="🛑")
+    if st.button(
+        f"Save to {Path(save_path_str).name}",
+        disabled=not can_save,
+        use_container_width=True,
+        help=f"Writes the editor contents to {save_path_str}. Disabled while YAML is invalid.",
+    ):
+        try:
+            Path(save_path_str).write_text(st.session_state["edited_text"], encoding="utf-8")
+            # Update "original" so future comparisons are against the saved file.
+            st.session_state["original_text"] = st.session_state["edited_text"]
+            st.toast(f"Saved → {save_path_str}", icon="💾")
+        except OSError as exc:
+            st.error(f"Save failed: {exc}", icon="🛑")
 
     with st.expander("Change save location", expanded=False):
         new_path = st.text_input(
@@ -365,9 +331,8 @@ def _render_editor_panel(yaml_path: Path) -> _ValidationResult:
     st.subheader("YAML editor")
     st.caption(f"Source: `{yaml_path}`")
 
-    # ``auto_update=False`` (the default) commits on blur / Ctrl+Enter rather
-    # than on every keystroke. That gives us "live enough" validation without
-    # hammering Streamlit's rerun loop while the user is mid-line.
+    # ``auto_update=False`` commits on blur / Ctrl+Enter rather than on every
+    # keystroke, showing an "Apply" button in the editor toolbar.
     new_text = st_ace(
         value=st.session_state["edited_text"],
         language="yaml",
@@ -389,18 +354,26 @@ def _render_editor_panel(yaml_path: Path) -> _ValidationResult:
 
     validation = _validate_yaml_text(st.session_state["edited_text"])
     _render_validation_badge(validation)
-    _render_action_buttons(validation)
+
+    # Auto-render whenever the YAML is valid and has changed since the last
+    # render. This runs before the right pane is drawn, so the updated HTML
+    # is already in session_state when the iframe is mounted — no extra rerun
+    # needed.
+    edited_since_render = st.session_state["edited_text"] != st.session_state["last_rendered_text"]
+    if validation.is_valid and edited_since_render:
+        with st.spinner("Rendering visualization…"):
+            st.session_state["rendered_html"] = _render_with_thumbnails(validation.spec)
+        st.session_state["last_rendered_text"] = st.session_state["edited_text"]
+        st.toast("Visualization updated.", icon="🔄")
+
+    _render_save_button(validation)
     return validation
 
 
 def _render_visualization_panel() -> None:
     """Right pane — iframe-mount the cached rendered HTML."""
     st.subheader("Visualization")
-    edited_since_render = st.session_state["edited_text"] != st.session_state["last_rendered_text"]
-    if edited_since_render:
-        st.caption("⚠️ Editor has unrendered changes — click **Regenerate visualization** to refresh.")
-    else:
-        st.caption("Showing the current YAML.")
+    st.caption("Updates automatically when the YAML is valid.")
 
     # ``st.components.v1.html`` wraps the payload in a sandboxed iframe, which
     # is what we want — the mermaid CDN script and the static CSS stay
