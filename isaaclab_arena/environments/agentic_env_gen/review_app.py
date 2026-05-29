@@ -30,6 +30,7 @@ Design:
 from __future__ import annotations
 
 import argparse
+import atexit
 import traceback
 import yaml
 from dataclasses import dataclass
@@ -38,9 +39,9 @@ from pathlib import Path
 import streamlit as st
 
 from isaaclab_arena.environments.agentic_env_gen.review_graph import (
-    launch_simulation_app,
+    SimAppSidecar,
+    SimAppSidecarError,
     render_html_for_spec,
-    render_thumbnails_for_spec,
 )
 from isaaclab_arena.environments.arena_env_graph_spec import ArenaEnvGraphSpec
 
@@ -50,84 +51,104 @@ _IFRAME_HEIGHT_PX = 1100
 
 
 # ---------------------------------------------------------------------------
-# SimulationApp lifecycle
+# SimulationApp sidecar lifecycle
 # ---------------------------------------------------------------------------
+#
+# Kit's ``SimulationApp`` cannot live inside the Streamlit worker thread:
+# its bootstrap installs signal handlers (main-thread only) and the
+# ``omni.usd`` UsdContext does not tolerate being driven from different
+# threads across Streamlit reruns ("[Error] [omni.usd] UsdContext busy").
+# We host it in a dedicated subprocess (``simapp_sidecar.py``) and talk to
+# it over a JSON-RPC pipe. The wrapper class ``SimAppSidecar`` in
+# ``review_graph`` owns the subprocess; we hold one instance per Streamlit
+# server process via ``@st.cache_resource``.
 
 
-def _patch_signal_for_non_main_thread() -> None:
-    """No-op ``signal.signal`` for non-main threads so Kit's bootstrap doesn't raise.
+@st.cache_resource(show_spinner="Booting Isaac Sim sidecar (≈30s first run, cached afterwards)…")
+def _get_simapp_sidecar() -> SimAppSidecar | None:
+    """Spawn the SimApp sidecar once per Streamlit server process.
 
-    Kit's ``SimulationApp.__init__`` installs SIGINT/SIGTERM handlers via
-    ``signal.signal``, which raises ``ValueError("signal only works in main
-    thread of the main interpreter")`` when called outside the interpreter's
-    main thread. Streamlit's ``ScriptRunner`` runs the user script in a
-    worker thread per session — so the SimApp boot would crash there even
-    though it would succeed under a plain ``python -m`` invocation.
+    Returns ``None`` if the sidecar fails to boot — the app then falls back
+    to placeholder thumbnails so the review page still renders. We register
+    an ``atexit`` cleanup so the sidecar is reaped on normal interpreter
+    shutdown (Ctrl-C of the terminal that owns Streamlit).
 
-    We swallow *only* the "main thread" ValueError and let everything else
-    propagate. The Streamlit main thread keeps its own SIGINT handler (it's
-    installed before our script ever runs), so Ctrl-C still tears the server
-    down cleanly. The patch is idempotent — repeated calls re-wrap the
-    already-wrapped function harmlessly.
+    The ``@st.cache_resource`` decorator gives us a single instance shared
+    across reruns AND across browser sessions, which is exactly what we
+    want: one Kit, many requests, serialized by the sidecar's own
+    ``threading.Lock``.
     """
-    import signal  # noqa: PLC0415
+    sidecar = SimAppSidecar()
+    try:
+        sidecar.start()
+    except SimAppSidecarError as exc:
+        print(f"[review_app] SimApp sidecar failed to start: {exc}", flush=True)
+        return None
 
-    if getattr(signal.signal, "_arena_patched", False):
-        return
-
-    _original_signal = signal.signal
-
-    def _safe_signal(signum, handler):
-        try:
-            return _original_signal(signum, handler)
-        except ValueError as exc:
-            if "main thread" in str(exc):
-                return None
-            raise
-
-    _safe_signal._arena_patched = True  # type: ignore[attr-defined]
-    signal.signal = _safe_signal  # type: ignore[assignment]
+    # atexit covers the common-case shutdown path (Ctrl-C in the launching
+    # terminal -> Python interpreter shutdown -> atexit handlers fire).
+    # Abnormal exits (SIGKILL of the Streamlit process) are handled by the
+    # sidecar itself: it watches for EOF on stdin and exits via its own
+    # ``finally`` block. So the SimApp gets closed either way.
+    atexit.register(sidecar.close)
+    return sidecar
 
 
-@st.cache_resource(show_spinner="Booting Isaac Sim (≈30s on first run, cached afterwards)…")
-def _get_simulation_app():
-    """Boot ``SimulationApp`` exactly once per Streamlit server process.
+def _ensure_sidecar() -> SimAppSidecar | None:
+    """Return a healthy sidecar, re-spawning if the cached one died.
 
-    ``@st.cache_resource`` is exactly the right primitive here: the returned
-    handle is shared across reruns and across browser sessions, and Streamlit
-    won't try to pickle it (unlike ``@st.cache_data``). If the boot fails we
-    return ``None`` and the app degrades to placeholder thumbnails — the
-    review page still works, just with the styled two-letter cards instead
-    of real USD captures.
-
-    The signal patch must happen *before* the SimApp launch (which happens
-    on the Streamlit worker thread); see ``_patch_signal_for_non_main_thread``.
+    If the cached resource exists but the subprocess crashed (e.g. an asset
+    triggered an unrecoverable Kit error), we clear the Streamlit cache and
+    start fresh. The single re-spawn keeps the user from having to restart
+    the whole Streamlit process for a transient render failure.
     """
-    _patch_signal_for_non_main_thread()
-    return launch_simulation_app()
+    sidecar = _get_simapp_sidecar()
+    if sidecar is not None and sidecar.is_alive():
+        return sidecar
+    if sidecar is not None:
+        # Sidecar died (crash / SIGKILL / whatever). Clean it up and ask
+        # Streamlit for a fresh one on the next call.
+        sidecar.close()
+    _get_simapp_sidecar.clear()
+    return _get_simapp_sidecar()
 
 
 def _render_with_thumbnails(spec: ArenaEnvGraphSpec) -> str:
-    """Render the review HTML for ``spec`` with thumbnails resolved through
-    the cached ``SimulationApp``.
+    """Render review HTML, asking the sidecar for thumbnails.
 
     Cache-aware in two layers:
       * The disk cache under ``.cache/llm_env_gen_thumbnails/`` survives
-        across runs; ``render_thumbnails_for_spec`` reads it directly.
-      * Within a run, ``@st.cache_resource`` ensures we never re-boot Kit.
+        across runs; the sidecar's internal renderer reads it directly.
+      * Within a server lifetime, ``@st.cache_resource`` keeps Kit warm so
+        only the cache-misses pay the ~2s-per-USD capture cost.
 
-    If ``SimulationApp`` is unavailable (boot failed) we fall back to
-    placeholder thumbnails so the user still gets a usable page.
+    If the sidecar is unavailable (boot failed and re-spawn also failed) we
+    fall back to placeholder thumbnails so the user still gets a usable page
+    and a visible warning explaining why.
     """
-    app = _get_simulation_app()
-    if app is None:
+    sidecar = _ensure_sidecar()
+    if sidecar is None:
         st.warning(
-            "Isaac Sim is unavailable — falling back to placeholder thumbnails. "
-            "Check the terminal where you launched the server for the boot error.",
+            "Isaac Sim sidecar is unavailable — falling back to placeholder thumbnails. "
+            "Check the terminal where you launched the server for the underlying error.",
             icon="⚠️",
         )
         return render_html_for_spec(spec, thumbnails=None)
-    thumbnails = render_thumbnails_for_spec(app, spec)
+
+    try:
+        thumbnails = sidecar.render_spec(spec)
+    except SimAppSidecarError as exc:
+        st.error(
+            f"Sidecar render failed; falling back to placeholder thumbnails.\n\n```\n{exc}\n```",
+            icon="🛑",
+        )
+        # Force a re-spawn on the next call — most "render failed" errors
+        # that propagate up are pipe-broken / process-died and the next
+        # invocation will boot a fresh Kit.
+        with st.spinner("Resetting the SimApp sidecar…"):
+            _get_simapp_sidecar.clear()
+        return render_html_for_spec(spec, thumbnails=None)
+
     return render_html_for_spec(spec, thumbnails=thumbnails)
 
 

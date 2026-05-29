@@ -56,15 +56,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import html as html_lib
+import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import yaml
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from isaaclab_arena.environments.arena_env_graph_spec import (
     ArenaEnvGraphNodeSpec,
@@ -174,36 +178,240 @@ def render_html_for_spec(spec: ArenaEnvGraphSpec, thumbnails: dict[str, bytes] |
 
     Thin public alias of :func:`_render_html` so external entry points don't
     have to reach into a private name. Pass ``thumbnails=None`` (or omit) to
-    fall back to placeholder thumbnails — useful when ``SimulationApp`` is
+    fall back to placeholder thumbnails — useful when the sidecar is
     unavailable.
     """
     return _render_html(spec, thumbnails=thumbnails)
 
 
-def launch_simulation_app():
-    """Public alias for :func:`_launch_simulation_app`.
+class SimAppSidecarError(RuntimeError):
+    """Raised when the SimApp sidecar process can't fulfil a request.
 
-    Boots Kit's ``SimulationApp`` (headless, with cameras + UI hidden) and
-    returns the live app handle. Returns ``None`` on failure so callers can
-    degrade gracefully (e.g. the Streamlit app falls back to placeholder
-    thumbnails instead of crashing).
-
-    The returned app *must* be reused across thumbnail renders — Kit only
-    supports one ``SimulationApp`` per process. The Streamlit app holds the
-    instance under ``@st.cache_resource``.
+    Distinct exception type so the Streamlit app can catch sidecar failures
+    specifically (and e.g. clear its ``@st.cache_resource`` to force a
+    re-spawn) without swallowing programming errors.
     """
-    return _launch_simulation_app()
 
 
-def render_thumbnails_for_spec(app, spec: ArenaEnvGraphSpec) -> dict[str, bytes]:
-    """Public alias for :func:`_render_thumbnails_with_app`.
+class SimAppSidecar:
+    """Long-lived Kit/SimApp host process exposed as a render service.
 
-    Resolves each node's USD via ``AssetRegistry``, reads the on-disk PNG
-    cache for hits, and renders cache-misses through the live ``app``
-    handle. Safe to call repeatedly across reruns — cache-hit cost is just
-    a ``read_bytes()`` per node.
+    See ``simapp_sidecar.py`` for the protocol. The instance is meant to be
+    cached for the lifetime of the Streamlit server process via
+    ``@st.cache_resource``; calling :meth:`render_spec` is safe across
+    Streamlit reruns and across concurrent sessions (an internal
+    ``threading.Lock`` serializes pipe access — Kit can only service one
+    render at a time anyway).
+
+    Lifecycle:
+
+      * :meth:`start` spawns the subprocess and waits for the ``{"ready":
+        true}`` handshake. Times out after ``boot_timeout_s`` if Kit boot
+        hangs.
+      * :meth:`render_spec` sends a ``render_spec`` request and reads the
+        reply line. Reads paths back, materializes the PNG bytes from the
+        shared filesystem cache, returns ``{node_id: bytes}``.
+      * :meth:`close` sends ``shutdown`` and waits for the process to exit,
+        terminating then killing if it doesn't.
+      * On parent crash / SIGKILL, the sidecar reads EOF on stdin and exits
+        on its own via the ``finally`` in ``simapp_sidecar._serve``.
     """
-    return _render_thumbnails_with_app(app, spec)
+
+    # Subprocess.Popen would normally inherit the parent's stderr. Kit
+    # writes a lot there, which is fine — we want users to see those logs.
+    # The JSON channel travels through stdout instead; the sidecar redirects
+    # Kit's stdout to stderr at the fd level before booting so the channel
+    # stays clean.
+
+    def __init__(self, *, boot_timeout_s: float = 180.0, shutdown_timeout_s: float = 10.0) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+        self._boot_timeout_s = boot_timeout_s
+        self._shutdown_timeout_s = shutdown_timeout_s
+
+    # -- lifecycle --
+
+    def start(self) -> None:
+        """Spawn the sidecar process and wait for its ``{"ready": true}`` handshake.
+
+        Raises :class:`SimAppSidecarError` if the boot fails (handshake says
+        ``ready: false``, sidecar exits early, or boot takes longer than
+        ``boot_timeout_s``).
+        """
+        if self._proc is not None and self._proc.poll() is None:
+            return  # already running
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "isaaclab_arena.environments.agentic_env_gen.simapp_sidecar",
+        ]
+        # ``start_new_session=False`` (default) leaves the child in the same
+        # process group as the parent, so Ctrl-C in the launching terminal
+        # also signals the sidecar. The sidecar installs SIGINT/SIGTERM
+        # handlers that route to a clean SystemExit -> finally -> app.close().
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # inherit so Kit logs flow to the user's terminal
+            text=True,
+            bufsize=1,  # line-buffered
+            env=os.environ.copy(),
+        )
+
+        # Block until we hear the ready handshake. We don't use signal-based
+        # timeout (only main thread can use ``signal.alarm``); a watchdog
+        # thread is overkill here, so we just rely on the boot being fast
+        # under normal conditions and let the user Ctrl-C if it really hangs.
+        # In practice Kit either boots in ~30s or fails immediately.
+        line = self._readline_or_die()
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as exc:
+            self._terminate()
+            raise SimAppSidecarError(f"Sidecar emitted non-JSON handshake: {line!r}") from exc
+
+        if not msg.get("ready"):
+            self._terminate()
+            raise SimAppSidecarError(
+                f"Sidecar boot failed: {msg.get('error', 'unknown error')}\n{msg.get('traceback', '')}"
+            )
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def close(self) -> None:
+        """Send ``shutdown``, then terminate/kill if the process doesn't exit.
+
+        Safe to call multiple times. Safe to call after the child has already
+        died (e.g. via SIGINT propagated from the terminal). Quiet about
+        common shutdown races so atexit doesn't spam the terminal.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        self._proc = None
+
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                proc.stdin.flush()
+            try:
+                proc.wait(timeout=self._shutdown_timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=5)
+
+        with contextlib.suppress(Exception):
+            if proc.stdin:
+                proc.stdin.close()
+        with contextlib.suppress(Exception):
+            if proc.stdout:
+                proc.stdout.close()
+
+    # -- requests --
+
+    def render_spec(self, spec: ArenaEnvGraphSpec) -> dict[str, bytes]:
+        """Ask the sidecar to render thumbnails for ``spec``.
+
+        Serializes the spec back to YAML (via ``ArenaEnvGraphSpec.to_dict``
+        which already unwraps Enums) before shipping it — the sidecar
+        re-parses on its end. We round-trip through YAML rather than JSON of
+        ``asdict`` because the sidecar already imports yaml and we already
+        trust ``ArenaEnvGraphSpec.from_dict`` to be the canonical parser.
+
+        Returns ``{node_id: png_bytes}`` ready to splice into the HTML.
+        Cache-hit nodes read from disk on the parent side (cheap mmap-style
+        ``read_bytes``); cache-miss nodes triggered a render in the sidecar
+        and we read the freshly-written file by the same code path.
+        """
+        if not self.is_alive():
+            raise SimAppSidecarError("SimApp sidecar is not running — start it first")
+
+        yaml_text = yaml.safe_dump(spec.to_dict(), sort_keys=False)
+
+        with self._lock:
+            response = self._request({"cmd": "render_spec", "yaml_text": yaml_text})
+
+        if not response.get("ok"):
+            raise SimAppSidecarError(
+                f"sidecar render failed: {response.get('error', 'unknown')}\n{response.get('traceback', '')}"
+            )
+
+        paths: dict[str, str] = response.get("paths", {}) or {}
+        results: dict[str, bytes] = {}
+        for node_id, path_str in paths.items():
+            path = Path(path_str)
+            if path.exists() and path.stat().st_size > 0:
+                results[node_id] = path.read_bytes()
+            else:
+                # Path missing despite a successful response — surface it on
+                # stderr but don't bail, the placeholder thumbnail will show.
+                print(
+                    f"[review_graph]   sidecar reported {node_id} -> {path_str} but file is missing.",
+                    file=sys.stderr,
+                )
+        return results
+
+    def ping(self) -> bool:
+        """Cheap liveness check round-trip — returns True on a healthy reply."""
+        if not self.is_alive():
+            return False
+        with self._lock:
+            try:
+                response = self._request({"cmd": "ping"})
+            except SimAppSidecarError:
+                return False
+        return bool(response.get("ok"))
+
+    # -- internals --
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Single request/response round-trip. Caller owns the lock."""
+        assert self._proc is not None and self._proc.stdin is not None and self._proc.stdout is not None
+        line = json.dumps(payload) + "\n"
+        try:
+            self._proc.stdin.write(line)
+            self._proc.stdin.flush()
+        except BrokenPipeError as exc:
+            raise SimAppSidecarError("sidecar pipe closed unexpectedly") from exc
+
+        reply_line = self._readline_or_die()
+        try:
+            return json.loads(reply_line)
+        except json.JSONDecodeError as exc:
+            raise SimAppSidecarError(f"sidecar replied with non-JSON: {reply_line!r}") from exc
+
+    def _readline_or_die(self) -> str:
+        """Read a line from sidecar stdout; raise if the pipe closes (sidecar died)."""
+        assert self._proc is not None and self._proc.stdout is not None
+        line = self._proc.stdout.readline()
+        if line == "":
+            exit_code = self._proc.poll()
+            raise SimAppSidecarError(
+                f"sidecar exited prematurely (exit code: {exit_code}). "
+                "See its stderr output above for the underlying cause."
+            )
+        return line
+
+    def _terminate(self) -> None:
+        """Hard-kill the sidecar — used when boot fails and graceful is moot."""
+        if self._proc is None:
+            return
+        with contextlib.suppress(Exception):
+            self._proc.terminate()
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(Exception):
+                self._proc.kill()
+        self._proc = None
 
 
 # ---------------------------------------------------------------------------
@@ -443,17 +651,24 @@ def _render_node_thumbnail(node: ArenaEnvGraphNodeSpec, png_bytes: bytes | None 
 # ---------------------------------------------------------------------------
 
 
-def _render_thumbnails_with_app(app, spec: ArenaEnvGraphSpec) -> dict[str, bytes]:
-    """Resolve each node's USD via ``AssetRegistry``, render or read cache.
+def _render_thumbnails_with_app(app, spec: ArenaEnvGraphSpec) -> dict[str, Path]:
+    """Resolve each node's USD via ``AssetRegistry``, render cache-misses, return PNG paths.
 
     ``app`` must already be a booted ``SimulationApp``. The caller owns the
-    lifecycle so the HTML write can happen before ``app.close()`` (which Kit
-    may turn into ``os._exit(0)``).
+    lifecycle (Kit may turn ``app.close()`` into ``os._exit(0)`` — that's why
+    the sidecar holds the only reference and closes it inside its ``finally``).
 
-    Returns ``{node.id: png_bytes}`` for nodes whose asset USD could be
-    located *and* rendered. Missing entries fall through to the placeholder
-    in :func:`_render_node_thumbnail`, so a partial failure (one bad asset)
-    never breaks the rest of the page.
+    Returns ``{node.id: png_path}`` for nodes whose asset USD could be located
+    *and* whose PNG exists on disk (either from the persistent cache under
+    ``_THUMBNAIL_CACHE_DIR`` or freshly rendered into the cache by
+    :func:`_capture_usd_thumbnails`). Missing entries fall through to the
+    placeholder in :func:`_render_node_thumbnail`, so a partial failure (one
+    bad asset) never breaks the rest of the page.
+
+    We return ``Path`` rather than ``bytes`` so the sidecar protocol can ship
+    just the filenames over its stdin/stdout pipe (a few hundred bytes of JSON
+    instead of multiple MB of base64 PNG data). The parent reads the bytes
+    itself off the shared filesystem cache.
 
     Ordering matters: ``SimulationApp`` MUST be launched before any
     ``AssetRegistry`` access, because ``ensure_assets_registered()`` imports
@@ -471,26 +686,32 @@ def _render_thumbnails_with_app(app, spec: ArenaEnvGraphSpec) -> dict[str, bytes
 
     # Split into cache-hits vs to-render. Cache key is sha1(usd_path) so
     # the same USD across multiple envs / nodes hits the same PNG.
-    rendered: dict[str, bytes] = {}
+    resolved: dict[str, Path] = {}
     to_render: dict[str, tuple[str, Path]] = {}
     for node_id, usd_path in asset_paths.items():
         cache_path = _THUMBNAIL_CACHE_DIR / f"{_usd_cache_key(usd_path)}.png"
         if cache_path.exists() and cache_path.stat().st_size > 0:
-            rendered[node_id] = cache_path.read_bytes()
+            resolved[node_id] = cache_path
         else:
             to_render[node_id] = (usd_path, cache_path)
 
     if to_render:
         print(
             f"[review_graph] rendering {len(to_render)} new thumbnail(s) "
-            f"(reusing {len(rendered)} from cache at {_THUMBNAIL_CACHE_DIR})...",
+            f"(reusing {len(resolved)} from cache at {_THUMBNAIL_CACHE_DIR})...",
             file=sys.stderr,
         )
-        rendered.update(_capture_usd_thumbnails(app, to_render))
+        # ``_capture_usd_thumbnails`` still returns ``{node_id: bytes}``, but
+        # we only use it as a presence signal here — the same call also wrote
+        # the PNG to ``cache_path`` as a side effect, which is what we return.
+        captured = _capture_usd_thumbnails(app, to_render)
+        for node_id, (_usd_path, cache_path) in to_render.items():
+            if node_id in captured and cache_path.exists() and cache_path.stat().st_size > 0:
+                resolved[node_id] = cache_path
     else:
-        print(f"[review_graph] all {len(rendered)} thumbnail(s) served from cache.", file=sys.stderr)
+        print(f"[review_graph] all {len(resolved)} thumbnail(s) served from cache.", file=sys.stderr)
 
-    return rendered
+    return resolved
 
 
 def _launch_simulation_app():
