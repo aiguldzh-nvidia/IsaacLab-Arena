@@ -5,6 +5,7 @@
 
 import yaml
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -81,10 +82,6 @@ class ArenaEnvGraphSpec:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ArenaEnvGraphSpec":
         data = as_dict(data, "Env graph spec")
-        nodes = parse_list(data, "nodes", _parse_node)
-        tasks = parse_list(data, "tasks", _parse_task)
-        state_specs = parse_list(data, "state_specs", _parse_state_spec)
-
         spec = cls(
             env_name=required_str(data, "env_name"),
             nodes=parse_list(data, "nodes", _parse_node),
